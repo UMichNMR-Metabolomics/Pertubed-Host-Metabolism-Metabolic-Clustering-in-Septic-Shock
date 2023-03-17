@@ -1,0 +1,523 @@
+---
+title: "RACE_Baseline_Clustering"
+author: "Teddy Jennaro"
+date: "February 10th, 2023"
+output: html_document
+---
+
+```{r}
+#Load Library and Set seed
+library('ggpubr')
+library('tidyverse')
+library('knitr')
+library('RColorBrewer')
+library('factoextra')
+library('NbClust')
+library('ComplexHeatmap')
+library('circlize')
+library('jtools')
+library('pbkrtest')
+library('ggeffects')
+library('gridExtra')
+set.seed(12345)
+```
+
+```{r}
+#load up ac_p_trans & nmr_p_trans from either of the R markdown files
+ac_p_trans %>% 
+  filter(Day == 0 & ACstatus == 1 & NMRstatus == 1) -> t0_ac
+
+nmr_p_trans %>% 
+  filter(Day == 0 & ACstatus == 1 & NMRstatus == 1) -> t0_nmr
+
+t0_ac$studyid %in% t0_nmr$studyid
+all.equal(t0_ac$studyid , t0_nmr$studyid)
+
+#69 patients have both nmr and ac measured at baseline 
+```
+
+```{r}
+t0_ac$studyid
+t0_nmr$studyid
+```
+
+
+```{r}
+#create a master df that will hold both AC and NMR metabolites 
+t0_master = t0_ac
+#sub in the transformed nmr data for the raw 
+t0_master[,54:80] = t0_nmr[,54:80]
+
+```
+
+```{r}
+t0_master %>% dplyr::select(29:52, 54:80) -> df_metab
+
+```
+
+```{r}
+res.pca <- prcomp(df_metab, scale = FALSE)
+
+fviz_eig(res.pca, 
+         addlabels = TRUE, 
+         ggtheme = theme_pubr(),
+         title = 'Baseline Metabolite Scree Plot')
+
+#elbow method selects 5 componets (~70% variance) 
+r_df_metab = res.pca$x[,1:5]
+```
+
+```{r}
+
+#optimal number of clusters on pca reduced data
+opt_clust_reduced <- fviz_nbclust(r_df_metab, kmeans, method = "silhouette") + 
+  ggtitle('Optimal number of clusters with PCA data reduction')
+
+#optimal number of clusters using full metabolomics data
+opt_clust_full <- fviz_nbclust(df_metab, kmeans, method = "silhouette") + 
+  ggtitle('Optimal number of clusters with full metabolomics data')
+
+
+
+
+```
+
+```{r}
+set.seed(12345)
+#cluster with reduced data
+k2 <- kmeans(r_df_metab, centers = 2, nstart = 25)
+#cluster with full data
+k2_full <- kmeans(df_metab, centers = 2, nstart = 25)
+
+```
+
+```{r}
+table(k2$cluster)
+table(k2_full$cluster)
+clust_res <- table(k2_full$cluster, k2$cluster) 
+colnames(clust_res) <- c('Assigned to Cluster 1 with \n PCA Dimensionality Reduction', 
+                         'Assigned to Cluster 2 with \n PCA Dimensionality Reduction')
+rownames(clust_res) <- c('Assigned to Cluster 1 with \n Full Metabolomics Data', 
+                         'Assigned to Cluster 2 with \n Full Metabolomics Data')
+
+
+clust_res_table <- tableGrob(clust_res)
+
+supp_fig <- ggarrange(opt_clust_reduced, opt_clust_full, grid.arrange(clust_res_table), 
+          labels = c('A', 'B', 'C'),
+          ncol = 1,nrow =3 )
+
+ggsave(supp_fig, width = 10, height = 12,
+       filename = 'Figures/Supplmentary_Figure1.tiff')
+
+
+```
+
+```{r}
+t0_master$cluster = factor(k2$cluster)
+table(t0_master$cluster,t0_master$Mortality28)
+```
+
+
+```{r}
+#get sofa and index score into this new data frame 
+#sofa and charlson dataframes were created in the Table1.R script 
+t0_master %>% 
+  inner_join(charlson %>% select(studyid, index_score), by = 'studyid') %>%
+  inner_join(SOFA, by = 'studyid') -> t0_master
+
+t0_master %>%
+  inner_join(df_Table1 %>% 
+               select(studyid, WBC.Value. , Bili.Value. , Lactate.Value.,
+                      Platelets.Value., BUN.Value., HGB.Value.,
+                      Cr.Value.), by = 'studyid') -> test
+```
+
+```{r}
+#setting themes for plotting
+theme_set(
+  theme_linedraw(base_size = 13) +
+    theme(
+      plot.title = element_text(hjust = 0.5), 
+      legend.title = element_blank(), 
+      legend.direction = 'horizontal',
+      panel.grid = element_blank(),
+      strip.text = element_text(margin = margin(b = 1, t = 1)))
+)
+```
+
+
+```{r, fig.height=4.5, fig.width=4.5}
+#visualize demograhics by clusters. Not used in final manuscript
+#Age vs. Cluster
+age_clust <- ggboxplot(t0_master, 
+         x = "cluster", y = "Age", color = "cluster",
+         palette = met.brewer("Cassatt2", 2),
+         add = "none") +
+  stat_compare_means(method = 'wilcox.test', 
+                     label = "p.format", 
+                     label.x = 2.25)+ 
+  xlab('Cluster')+ ylab('Years') +
+  theme_get()+
+  ggtitle('Age') +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = 'none') 
+
+#Charlson vs. Cluster
+charlson_clust <- ggboxplot(t0_master, 
+         x = "cluster", y = "index_score", color = "cluster",
+         palette = met.brewer("Cassatt2", 2),
+         add = "none") + 
+  stat_compare_means(method = 'wilcox.test', 
+                     label = "p.format", 
+                     label.x = 2.25) + 
+  xlab('Cluster') + ylab('Score') + 
+  ggtitle('Charlson Comorbidity Index') + 
+  theme_get() +  
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = 'none')
+
+#Sofa vs. Cluster
+sofa_clust <- ggboxplot(t0_master, 
+         x = "cluster", y = "Calculated.T0.SOFA.Value", 
+         color = "cluster",
+         palette = met.brewer("Cassatt2", 2),
+         add = "none", ) + 
+  stat_compare_means(method = 'wilcox.test', 
+                     label = "p.format", 
+                     label.x = 2.25) + 
+  xlab('Cluster')+ ylab('Score') +
+  theme_get() + 
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = 'none') + 
+  ggtitle('Baseline SOFA Score')
+
+# #Mortrality vs. Cluster
+# t0_master %>% group_by(cluster) %>% count(Mortality28) %>%
+#   mutate(prop = 100*(n / sum(n))) %>% 
+#   ggplot(aes(x = cluster, y = prop, fill = as.factor(Mortality28))) + 
+#   geom_bar(stat = 'identity', position = 'dodge', alpha = 2/3) +
+#   xlab('Cluster')+ ylab('28-Day Mortality (%)') + 
+#   scale_fill_manual(name = "28-Day Survival Status",
+#     labels = c("Survivor", "Non-Survivor"),
+#     values = c('#377EB8', '#E41A1C')) + 
+#   theme_pubr() + 
+#   labs_pubr() 
+
+#plot of sex by cluster 
+tab <- table(t0_master$Sex, t0_master$cluster)
+pval <- chisq.test(tab)$p.value
+sex_clust <- t0_master %>% 
+  mutate(sex_num = ifelse(Sex == 'Female', 1, 0)) %>% 
+  ggbarplot(x = "cluster", y = "sex_num", 
+            color = 'cluster',  
+            palette = met.brewer("Cassatt2", 2),
+            add = "mean_se", error.plot = "upper_errorbar") + 
+  theme_get() + 
+  ggtitle('Sex') + 
+  xlab('Cluster') + ylab('Percent Female') + 
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = 'none')+ 
+  annotate("text", x=2.25, y =0.8, 
+           label=paste0("p = ", signif(pval,2)))
+
+#plot of race by cluster
+t0_master$Race_update = ifelse(t0_master$Race == "African American",
+                        yes = "African American", no = 'Other')
+
+tab <- table(t0_master$Race_update, t0_master$cluster)
+pval <- chisq.test(tab)$p.value
+race_clust <- t0_master %>% 
+  mutate(race_num = ifelse(Race_update == "African American", 1, 0)) %>% 
+  ggbarplot(x = "cluster", y = "race_num", 
+            color = 'cluster',  
+            palette = met.brewer("Cassatt2", 2),
+            add = "mean_se", error.plot = "upper_errorbar") + 
+  theme_get() + 
+  ggtitle('Self-Identified Race') + 
+  xlab('Cluster') + ylab('Percent African American') + 
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = 'none')+ 
+  annotate("text", x=2.25, y =0.8, 
+           label=paste0("p = ", signif(pval,2)))
+```
+
+```{r}
+t0_master %>% pivot_longer(cols = starts_with("Calculated"), 
+                           names_to = 'sofa_obs',
+                           values_to = 'SOFA') %>% 
+  select(studyid, sofa_obs, SOFA, cluster) %>% 
+  mutate(sofa_time = recode(sofa_obs, 
+                           `Calculated.T0.SOFA.Value`=0,
+                           `Calculated.T12.SOFA.Value`= 0.5,
+                           `Calculated.T24.SOFA.Value`=1,
+                           `Calculated.T48.SOFA.Value`=2),
+         sofa_timepoint = recode(sofa_obs, 
+                           `Calculated.T0.SOFA.Value`= 'T0',
+                           `Calculated.T12.SOFA.Value`= 'T12',
+                           `Calculated.T24.SOFA.Value`='T24',
+                           `Calculated.T48.SOFA.Value`='T48')) %>%
+  fill(SOFA, .direction = 'down') -> df_sofa_time
+
+df_sofa_time$cluster_fact = factor(df_sofa_time$cluster, levels = c(2,1))
+
+#fit mixed models 
+null_sofa <- lme4::lmer(SOFA ~ (1 | studyid), data = df_sofa_time)
+
+fixed_sofa <- lme4::lmer(SOFA ~  sofa_time + cluster_fact + (1 | studyid), 
+                         data = df_sofa_time)
+
+int_sofa <- lme4::lmer(SOFA ~  sofa_time * cluster_fact + (1 | studyid), 
+                       data = df_sofa_time)
+
+#F-test for significance of interaction term
+KRtest <- KRmodcomp(fixed_sofa, int_sofa)
+
+#this one is for plotting and color consistency 
+int_sofa_plot <- lme4::lmer(SOFA ~  sofa_time * cluster + (1 | studyid), 
+                       data = df_sofa_time)
+
+#sofa score over time stratified by cluster
+sofa_model_preds <- ggpredict(int_sofa_plot, terms = c("sofa_time", "cluster")) %>% plot() + 
+  scale_color_manual(name = "Cluster", 
+                     labels = c("#1", "#2"),
+                     values=met.brewer("Cassatt2", 2)) + 
+  scale_fill_manual(name = "Cluster", 
+                     labels = c("#1", "#2"),
+                     values=met.brewer("Cassatt2", 2)) + 
+  theme_get() + 
+  ggtitle('SOFA Score vs. Time') + 
+  xlab('Time (days)') + ylab('Score') +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = c(0.2,0.15), 
+        legend.direction = 'horizontal')
+
+df_sofa_time %>% 
+  ggplot(aes(x=sofa_obs, y =SOFA,
+             group = cluster, color=cluster
+            )) + 
+  stat_summary(fun.data = "median_hilow", 
+               fun.args=(conf.int=0.5), geom = 'errorbar',
+               position = pd, width = 0.2) + 
+  stat_summary(fun = 'median', geom = 'line', 
+               mapping = aes(group=cluster),
+               position = pd) + 
+  stat_summary(fun = 'median', geom = 'point', 
+               mapping = aes(group=cluster),
+               position = pd) +
+  stat_compare_means(label = 'p.signif', show.legend = F,
+                     symnum.args = list(
+                       cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1), 
+                       symbols = c("****", "***", "**", "*", ""))) +
+  scale_color_manual(name = "Cluster", 
+                     labels = c("#1", "#2"),
+                     values=met.brewer("Cassatt2", 2)) + 
+  geom_jitter(position = pd, alpha = 0.05) + theme_pubr()
+
+#plot model coefficients for SOFA score ~ Time + cluster + Interaction
+sofa_model_coefs <- plot_summs(fixed_sofa, int_sofa,
+           model.names = c('Fixed-Effect Model', 'Interaction Model'),
+           colors = met.brewer("Ingres", 2),
+           plot.distributions = FALSE,
+           coefs = c(
+                     "Time" = "sofa_time",
+                     "Cluster" = "cluster_fact1", 
+                     "Time:Cluster" = "sofa_time:cluster_fact1")) + 
+  theme_get() + 
+  xlab('Estimated Slope') + 
+  ylab(NULL) + 
+  annotate("text", x=3.5, y =1.05, 
+           label=paste("Kenward-Roger F-Test,\n   Interaction p-value =",
+                        signif(KRtest$stats$p.value,2))) + 
+  ggtitle('Linear Mixed Models ~ SOFA Score') + 
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = c(0.8,0.8), 
+        legend.direction = 'vertical') 
+
+```
+
+
+
+```{r, fig.height=4.5, fig.width=4.5}
+#logistic regression mortality models
+
+##cluster assignment
+t0_master$cluster_fact = factor(t0_master$cluster, levels = c(2,1))
+
+##model without cluster assignment
+m0 = glm(Mortality28 ~ 
+            Calculated.T0.SOFA.Value + index_score + Age , 
+         family='binomial', data=t0_master)
+summary(m0)
+
+##model with cluster assignment
+m1 = glm(Mortality28 ~ 
+           cluster_fact + Calculated.T0.SOFA.Value + index_score + Age, 
+         family='binomial', data=t0_master)
+summary(m1)
+
+#likelihood ratio test for significance of cluster 
+lrt_p <- anova(m0, m1, test = 'Chisq')$`Pr(>Chi)`[2]
+```
+
+
+```{r, fig.height=4.5, fig.width=4.5}
+#plot model coefficients from above 
+log_reg_output <- plot_summs(m0, m1, scale=TRUE, exp = TRUE, 
+           model.names = c('Covariate Model', 'Covariate + Cluster Model'),
+           colors = met.brewer("Ingres", 2),
+           plot.distributions = F,
+           coefs = c("Age" = "Age",
+                     "Baseline\nSOFA" = "Calculated.T0.SOFA.Value", 
+                     "Charlson\nIndex" = "index_score",
+                     "Cluster"="cluster_fact1")) + 
+  theme_get() + 
+  xlab('Estimated Odds Ratio (OR)') + 
+  ylab(NULL) + 
+  annotate("text", x=16.5, y =1.55, 
+           label=paste("Likelihood Ratio Test,\n       Cluster p-value =",
+                        signif(lrt_p,2))) + 
+  ggtitle('Logistic Regression ~ 28-Day Mortality') + 
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = c(0.65,0.7), 
+        legend.direction = 'vertical') 
+```
+```{r}
+library('survival')
+library('survminer')
+```
+
+
+```{r}
+#censored status. 1 == censored or 2 == died within study follow-up
+t0_master$censored = 
+  ifelse(t0_master$survivaldays == 365, 1, 2)
+
+```
+
+```{r, fig.width=4.5, fig.height=4.5}
+#generate survival curves
+surv_object <- Surv(time = t0_master$survivaldays, 
+                    event = t0_master$censored)
+
+fit1 <- survfit(surv_object ~ cluster, 
+                data = t0_master)
+
+custom_theme <- function() {
+  theme_pubr() %+replace%
+    theme(
+      plot.title=element_text(hjust=0.5), 
+      legend.title=element_blank()
+      
+    )
+}
+
+
+surv_plot <- ggsurvplot(fit1, data = t0_master, risk.table = T, 
+                        ggtheme = theme_get() ,
+           pval = TRUE, palette = met.brewer("Cassatt2", 2),
+           legend.labs = c("Cluster 1", "Cluster 2"),
+           pval.coord = c(0, 0.05), conf.int = T,
+           xlim = c(0,365), 
+           legend = c(0.6,0.9)) + 
+  xlab('Days') + ggtitle('One-Year Survival Curves') 
+
+surv_plot$plot <- surv_plot$plot+ ggtitle('One-Year Survival Curves')
+
+survival_plot <- ggarrange(align='v',
+          heights = c(2,1),
+          ncol=1, 
+          surv_plot$plot, surv_plot$table)  
+
+```
+
+```{r, fig.height=10, fig.width=11.5}
+#create heatmap
+metabs_t = t(df_metab %>% 
+               rename('2-Hydroxybutyrate'= X2.Hydroxybutyrate,
+                      '2-Oxoisocaproate' = X2.Oxoisocaproate, 
+                      '3-Hydroxybutyrate'= X3.Hydroxybutyrate,
+                      'Histidine' = Histidine.x,
+                      'L-Carnitine (NMR)' = Carnitine, 
+                      'C2 (NMR)' = O.Acetylcarnitine,
+                      'C2 (LC-MS)' = C2, 
+                      'L-Carnitine (LC-MS)' = L.carnitine))
+
+t0_master$Mortality_char <- ifelse(t0_master$Mortality28 == 1,'Non-Survivor', "Survivor")
+
+age_fun = colorRamp2(c(20, 50, 100), c("#F0F0F0", "#969696", "#252525"))
+
+ha = HeatmapAnnotation(
+    Age = t0_master$Age, 
+    annotation_legend_param = list(
+                legend_direction = "horizontal"),
+    Mortality = t0_master$Mortality_char, 
+    annotation_name_gp = gpar(fontsize = 10, fontface = "bold"),
+    show_legend = TRUE,
+    col = list(Age = age_fun,
+               Mortality = c("Non-Survivor" = "#E41A1C", 
+                             "Survivor" = "#377EB8")
+    ), gp = gpar(col = "black")
+)
+             
+col_fun =  colorRamp2(c(-3, 0, 3), 
+                      c('#235070', "#F7F7F7", '#6c1d0e'))
+
+mat = Heatmap(metabs_t, name= 'Concentration', 
+              col = col_fun, 
+              show_column_dend = FALSE, show_row_dend = FALSE,
+              row_km = 3, row_km_repeats = 100,
+              border = FALSE, column_gap = unit(2, "mm"),
+              #row_names_gp = grid::gpar(fontsize = 5),
+              column_split = t0_master$cluster_fact,
+              row_title = NULL, 
+              heatmap_legend_param = list(
+                legend_direction = "horizontal"),
+              row_names_gp = gpar(fontsize = 10, fontface = "bold"),
+
+              top_annotation = ha)
+heatmap <- grid.grabExpr(draw(mat,
+     column_title = "Cluster", 
+     heatmap_legend_side="bottom", annotation_legend_side="bottom", 
+     show_heatmap_legend = TRUE, merge_legend = TRUE,
+     column_title_gp = gpar(fontsize = 20, fontface = "bold")))
+
+
+```
+
+
+
+```{r}
+#figure 4
+##heatmap on top
+#boxplots of demographics and patient characteristics below
+fig4 <- ggarrange(nrow=3, labels = c('A',"",'B'), 
+                  heights =c(2, 0.2, 1), 
+                  heatmap, ggplot() + theme_void(),
+                  ggarrange(nrow =1, age_clust, charlson_clust, 
+                    sex_clust, race_clust) 
+                    )
+
+ggsave(plot = fig4, 
+       filename = 'Figures/Figure4.tiff',  
+       width = 15, height = 15)
+```
+
+```{r}
+#figure 5
+#sofa score model coefficients and model predictions over time on top
+#logistic regression model coffieicents and survival curves below
+fig5 <- ggarrange(nrow=3, labels = c('A',"",'B'), 
+                  heights =c(1, 0.1, 1), 
+                  ggarrange(nrow =1, sofa_model_coefs, sofa_model_preds ),
+                  ggplot() + theme_void(),
+                  ggarrange(nrow =1, 
+                            log_reg_output, 
+                            survival_plot) 
+                    )
+
+ggsave(plot = fig5, 
+       filename = 'Figures/Figure5.tiff',  
+       width = 15, height = 15)
+```
+

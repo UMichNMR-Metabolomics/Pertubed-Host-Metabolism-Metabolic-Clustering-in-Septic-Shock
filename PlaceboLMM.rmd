@@ -1,0 +1,491 @@
+---
+title: "LMM RACE Placebo"
+author: "Teddy Jennaro"
+date: "February 9, 2023"
+output: 
+  html_document:
+     df_print: paged
+      toc: true
+      toc_depth: 4
+      toc_float:
+        collapsed: no
+        smooth_scroll: yes
+---
+
+```{r PackageLoad, echo=FALSE, message=FALSE, warning=FALSE}
+library('ggpubr')
+library('tidyverse')
+library('knitr')
+library('lme4')
+library("sjPlot")
+library('lattice')
+library('ggeffects')
+library('MetBrewer')
+library('pbkrtest')
+library('mixedup')
+library('formulaic')
+library('flextable')
+
+```
+
+## Introduction
+
+This R Markdown document analyzes longitudinal metabolomics data from the Rapid Administration of L-Carnitine in Septic Shock (RACE) clinical trial. Serum samples were collected at baseline (T0), 24-hours (T24), and 48-hours (T48) post-enrollment, and metabolic data was generated from LC-MS/MS (acylcarnitines) and 1H-NMR. This objective of this analysis is to characterize the metabolic host-reponse in septic shock (i.e. saline placebo-treated patients). 
+
+## Load and Process Data
+
+```{r FileLoad, echo=FALSE}
+
+#load in master CSV of RACE Data
+file = 'Data/RACE_combined.csv'
+
+df_master = read.csv(file)
+```
+
+```{r CodeVariables, echo=FALSE}
+#make time numeric, create a 'day' variable, and create 28-day mortality
+df_master %>% mutate(Time = recode(Timepoint, 
+                           `T0`=0,
+                           `T24`=24,
+                           `T48`=48,
+                           `T72`=72),
+                     Day = Time / 24,
+                     Mortality28 = case_when(
+                       survivaldays <= 28 ~ 1,
+                       survivaldays >28 ~0)) -> df_master
+
+#consider only data from 0-48 hours in patients with:
+#1) acylcarnitines measured; 2) treated with placebo (dose == 0);
+ac_p = df_master %>% 
+  filter(ACstatus==1 & Timepoint != 'T72' & dose == 0 )
+
+```
+
+```{r CheckCounts, echo=FALSE}
+ac_p %>% group_by(Timepoint) %>% 
+  summarize(n=n())
+
+ac_p %>% distinct(studyid, .keep_all = TRUE) %>%
+  group_by(Mortality28) %>% 
+  summarize(n=n())
+
+```
+
+
+```{r PrepareAC}
+#cols 39:62 represent the measurement of 24 acylcarnitine species
+#importantly there is no missing data in this LC-MS/MS data. 
+#First log transform the data, then standardize to a mean of zero and sd of 1. 
+ac_p %>% 
+  mutate_at(29:52, log) %>%
+  mutate_at(29:52, scale) -> ac_p_trans
+```
+
+NMR Metabolomics has missing data. In metabolites with sufficient data (i.e. <30% missingness), we will compute missing values as the minimum concnetration observed divided by 2. Since serum samples were randomized into batches upon processing, we will impute missing values in the entire cohort (placebo & treated patients) and then filter out patients who received study drug. 
+```{r PrepareNMR}
+#first consider only data from 0-48 hours in patients with:
+#1) NMR measured
+nmr = df_master %>% 
+  filter(NMRstatus==1)
+
+#calculate the missing rate for each metabolite
+#NMR metabolites represent columns 64:90
+metab_missing_rate = apply(nmr[,54:80], MARGIN=2, FUN=function(x) { sum(is.na(x)) / length(x) } )
+
+```
+
+Since there are no metabolites with a missing rate > 30%, all measured metabolite columns can be considered further. 
+
+```{r}
+#impute missing as min observed / 2
+nmr_metabolites = nmr[,54:80]
+nmr_metabolites_imp_val = apply(nmr_metabolites, FUN=function(x) { min(x,na.rm = T) }, MARGIN = 2) / 2
+
+#loop through & replace missing values 
+for(j in 1:dim(nmr_metabolites)[2]) {
+  imp_val = as.numeric(nmr_metabolites_imp_val[j])
+  vals = as.numeric(nmr_metabolites[,j])
+  nmr_metabolites[is.na(vals),j] = imp_val
+}
+
+#replace columns 
+nmr_metabolites_matrix = as.matrix(nmr_metabolites)
+nmr[,54:80] = data.frame(nmr_metabolites_matrix)
+```
+
+
+```{r}
+nmr_p = nmr %>% 
+  filter(dose == 0 & Timepoint != 'T72')
+
+nmr_p %>% group_by(Timepoint) %>% 
+  summarize(n=n())
+
+nmr_p %>% distinct(studyid, .keep_all = TRUE) %>%
+  group_by(Mortality28) %>% 
+  summarize(n=n())
+```
+
+```{r}
+nmr_p %>% 
+  mutate_at(54:80, log) %>%
+  mutate_at(54:80, scale) -> nmr_p_trans
+```
+
+
+
+```{r GetMetaboliteNames}
+#this gets the column names from AC and NMR datasets
+#we will use these later to loop in mixed model functions
+ac_metabs = colnames(ac_p_trans)[29:52]
+nmr_metabs = colnames(nmr_p_trans)[54:80]
+
+```
+
+```{r PrepareCytokineData}
+#this will load in the cytokine data and prepare it for LMM
+cyto_df <- read_csv('Data/RACE_CytokineData.csv')
+model_cyto_df <- cyto_df %>% 
+  mutate(Time = recode(Timepoint, 
+                       `T0`=0,
+                       `T24`=24,
+                       `T48`=48,
+                       `T72`=72),
+         Day = Time / 24, 
+         Sex = `Gender:`,
+         Age_cent = Age - 59.63889, 
+         T0_SOFA_cent = `Calculated T0 SOFA Value` - 11) %>% 
+  mutate(across(c(Fractalkine:ANG2),log)) %>% 
+  mutate(across(c(Fractalkine:ANG2), scale))
+
+cyto_names <- model_cyto_df %>% 
+  select(Fractalkine:ANG2) %>% 
+  colnames()
+
+cyto_names <- add.backtick(cyto_names)
+
+```
+
+
+```{r LMM_FXN}
+#this is the function which will complete linear mixed modeling
+#it selects fixed vs. interaction models based on the BIC
+#it then calculates the overall p value in comparison to null model
+#the user specifies the type of models to consider 
+LMM <- function(metabs, eq1, eq2, eq3, df){
+  print(metabs)
+  null_eq = paste(metabs, eq1)
+  null_mod = lmer(null_eq, data = df)
+  #summary(null_mod)
+  
+  fixed_eq = paste(metabs, eq2)
+  fixed_mod = lmer(fixed_eq, data = df)
+  fixed_BIC = BIC(fixed_mod)
+  fixed_summary = extract_fixed_effects(fixed_mod)
+  #summary(fixed_mod)
+  
+  int_eq = paste(metabs, eq3)
+  int_mod = lmer(int_eq, data = df)
+  int_BIC = BIC(int_mod)
+  int_summary = extract_fixed_effects(int_mod)
+  #summary(fixed_mod)
+  
+  LRT1_2 = KRmodcomp(null_mod, fixed_mod)
+  fixed_p = LRT1_2$stats$p.value
+  
+  LRT1_3 = KRmodcomp(null_mod, int_mod)
+  int_p = LRT1_3$stats$p.value
+  
+  LRT2_3 = KRmodcomp(fixed_mod, int_mod)
+  test_p = LRT2_3$stats$p.value
+  
+  if (test_p < 0.05) {
+    overall_p = int_p
+    
+    overall_mod = "Interaction Model"
+    
+    Day = int_summary %>% 
+      filter(term == 'Day') %>% 
+      select(value, lower_2.5, upper_97.5) %>%  
+      unite(int, lower_2.5:upper_97.5, sep = ', ') %>% 
+      mutate(int = paste('(', int, ')', sep='')) %>% 
+      unite(DaySlope, value:int, sep = " ") %>% pull
+    
+    Mortality28 = int_summary %>% 
+      filter(term == 'Mortality28') %>% 
+      select(value, lower_2.5, upper_97.5) %>%  
+      unite(int, lower_2.5:upper_97.5, sep = ', ') %>% 
+      mutate(int = paste('(', int, ')', sep='')) %>% 
+      unite(DaySlope, value:int, sep = " ") %>% pull
+    
+    Int = int_summary %>% 
+      filter(term == 'Day:Mortality28') %>% 
+      select(value, lower_2.5, upper_97.5) %>%  
+      unite(int, lower_2.5:upper_97.5, sep = ', ') %>% 
+      mutate(int = paste('(', int, ')', sep='')) %>% 
+      unite(DaySlope, value:int, sep = " ") %>% pull
+    
+    
+  } else{
+    overall_p = fixed_p
+    
+    overall_mod = "Fixed Effects Only Model"
+    
+    Day = fixed_summary %>% 
+      filter(term == 'Day') %>% 
+      select(value, lower_2.5, upper_97.5) %>%  
+      unite(int, lower_2.5:upper_97.5, sep = ', ') %>% 
+      mutate(int = paste('(', int, ')', sep='')) %>% 
+      unite(DaySlope, value:int, sep = " ") %>% pull
+        
+    Mortality28 = fixed_summary %>% 
+      filter(term == 'Mortality28') %>% 
+      select(value, lower_2.5, upper_97.5) %>%  
+      unite(int, lower_2.5:upper_97.5, sep = ', ') %>% 
+      mutate(int = paste('(', int, ')', sep='')) %>% 
+      unite(DaySlope, value:int, sep = " ") %>% pull
+    
+    Int = NA
+  }
+  
+  return(c(metabs, overall_mod, overall_p, Day, Mortality28, Int))
+
+  }
+
+
+
+```
+
+```{r}
+#center co-variables 
+nmr_p_trans$Age_cent <- nmr_p_trans$Age - 59.63889
+nmr_p_trans$T0_SOFA_cent <- nmr_p_trans$Calculated.T0.SOFA.Value - 11
+
+ac_p_trans$Age_cent <- ac_p_trans$Age - 59.63889
+ac_p_trans$T0_SOFA_cent <- ac_p_trans$Calculated.T0.SOFA.Value - 11
+```
+
+
+```{r}
+#Define the mixed models
+#each conctains a patient level intercept
+#null also has covariables
+#fixed adds Day + Mortality 
+#int adds Day * Mortality 
+null = " ~ Age_cent + Sex + T0_SOFA_cent  +  (1 | studyid)"
+fixed = "~ Age_cent + Sex + T0_SOFA_cent + Day + Mortality28 + (1 | studyid)"
+int = "~  Age_cent + Sex + T0_SOFA_cent + Day * Mortality28 + (1 | studyid)"
+
+
+```
+
+
+
+```{r}
+#run on NMR
+nmr_LMM_results_RI = lapply(
+  nmr_metabs, function(x) 
+  LMM(metabs = x, 
+    eq1 = null,
+    eq2 = fixed, 
+    eq3 = int, 
+    df = nmr_p_trans))
+
+#run on ACs
+ac_LMM_results_RI = lapply(
+  ac_metabs, function(x) 
+  LMM(metabs = x, 
+    eq1 = null,
+    eq2 = fixed, 
+    eq3 = int, 
+    df = ac_p_trans))
+
+#run on cytokines
+cyto_res_LMM_results_RI = lapply(
+  cyto_names, function(x) 
+  LMM(metabs = x, 
+    eq1 = null,
+    eq2 = fixed, 
+    eq3 = int, 
+    df = model_cyto_df))
+
+#bind together
+#make p-value numeric; adjust according to FDR;
+#rank-order
+#rename
+data.frame(do.call(rbind, nmr_LMM_results_RI) %>% 
+             as_tibble() %>% 
+             mutate(Platform = 'NMR')) %>% 
+  bind_rows(data.frame(do.call(rbind, ac_LMM_results_RI) %>% 
+                         as_tibble() %>%
+                         mutate(Platform = 'LC-MS'))) %>% 
+  bind_rows(data.frame(do.call(rbind, cyto_res_LMM_results_RI) %>% 
+                         as_tibble() %>%
+                         mutate(Platform = 'Protein Immunoassay'))) %>%
+  mutate(p = as.numeric(V3)) %>% 
+  mutate(`Q-Value` = p.adjust(p, method = 'fdr')) %>% 
+  arrange(Platform, `Q-Value`) %>% 
+  rename(Metabolite = V1,
+         `Model Selected` = V2, 
+         Time = V4, 
+         Mortality = V5, 
+         Interaction = V6) %>% 
+  select(Metabolite, Platform, `Model Selected`, 
+         `Q-Value`,
+         Time, Mortality, Interaction) %>% 
+  flextable() %>% 
+  set_formatter(
+        `Q-Value` = function(x) sprintf("%.02e", x)
+      ) %>% 
+  align(align ='center', part = 'all') %>% 
+  align(j = 1, align ='left', part = 'all') %>% 
+
+  bold(bold = TRUE, part = 'header') %>%
+  flextable::autofit() -> ft2
+
+tf <- tempfile(fileext = ".docx")
+save_as_docx(ft2, path = tf)
+         
+```
+
+```{r}
+plotserieslines <- function(df, yvar, group){
+  ggplot(data = df, aes_(x= ~Timepoint, y = as.name(yvar),
+             group = ~Mortality28, color= ~Mortality28
+            )) + 
+    stat_summary(fun.data = "median_hilow", 
+               fun.args=(conf.int=0.5), geom = 'errorbar',
+               position = pd, width = 0.2) + 
+    stat_summary(fun = 'median', geom = 'line', 
+               mapping = aes(group= Mortality28),
+               position = pd) + 
+    stat_summary(fun = 'median', geom = 'point', 
+               mapping = aes(group= Mortality28),
+               position = pd) +
+    stat_compare_means(label = 'p.signif', show.legend = F,
+                       symnum.args = list(
+                         cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1),
+                         symbols = c("****", "***", "**", "*", ""))) +
+    scale_color_manual(name = "28-Day Status",
+                       labels = c("Survivor", "Non-Survivor"),
+                       values=met.brewer("Troy", 2)) + 
+    geom_jitter(position = pd, alpha = 0.05)
+}
+```
+
+
+```{r}
+ac_p_plot <- ac_p %>% 
+  mutate_at(.vars = 29:52, ~log(., base=10)) %>% 
+  mutate(Mortality28 = as.factor(Mortality28))
+
+nmr_p_plot <- nmr_p %>% 
+  mutate_at(.vars = 54:80, ~log(., base=10)) %>% 
+  mutate(Mortality28 = as.factor(Mortality28))
+
+cyto_p_plot <- cyto_df %>%
+  mutate_at(.vars = 8:17, ~log(., base=10)) %>% 
+  mutate(Mortality28 = as.factor(Mortality28))
+  
+  
+```
+
+```{r}
+#setting themes for plotting
+theme_set(
+  theme_linedraw(base_size = 13) +
+    theme(
+          panel.grid = element_blank(),
+          strip.text = element_text(margin = margin(b = 1, t = 1)))
+)
+#dodge for space between outcomes on plots
+pd <- position_dodge(width = 0.5)
+```
+
+
+```{r}
+C2_p <- plotserieslines(df = ac_p_plot, yvar = 'C2') + 
+  ylab (label = expression(Log[10] ~ paste(mu,M))) +
+  ggtitle("Acetylcarnitine (C2)") + 
+  #theme_pubr() + 
+  theme(plot.title = element_text(hjust = 0.5)) 
+
+C6_p <- plotserieslines(df = ac_p_plot, yvar = 'C6') + 
+  ylab (label = expression(Log[10] ~ paste(mu,M))) +
+  ggtitle("Hexanoylcarnitine (C6)") + 
+  rremove('ylab') +
+  #theme_pubr() + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+C8_p <- plotserieslines(df = ac_p_plot, yvar = 'C16') + 
+  ylab (label = expression(Log[10] ~ paste(mu,M))) +
+  ggtitle("Palmitoylcarnitine (C16)") + 
+  rremove('ylab') +
+  #theme_pubr() + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+ac_top_plots <- ggarrange(C2_p , C6_p, C8_p, nrow = 1,
+          common.legend = TRUE, legend = 'none')
+  
+
+```
+
+```{r}
+Isoleucine_p <- plotserieslines(df = nmr_p_plot, yvar = 'Isoleucine') + 
+  ylab (label = expression(Log[10] ~ paste(mu,M))) +
+  ggtitle("Isoleucine") + 
+  #theme_pubr() + 
+  theme(plot.title = element_text(hjust = 0.5)) 
+
+Lactate_p <- plotserieslines(df = nmr_p_plot, yvar = 'Lactate') + 
+  ylab (label = expression(Log[10] ~ paste(mu,M))) +
+  ggtitle("Lactate") + 
+  #theme_pubr() + 
+  theme(plot.title = element_text(hjust = 0.5)) 
+
+Pyruvate_p <- plotserieslines(df = nmr_p_plot, yvar = 'Pyruvate') + 
+  ylab (label = expression(Log[10] ~ paste(mu,M))) +
+  ggtitle("Pyruvate") + 
+  #theme_pubr() + 
+  theme(plot.title = element_text(hjust = 0.5)) 
+
+nmr_top_plots <- ggarrange(Isoleucine_p , Lactate_p, Pyruvate_p, nrow = 1,
+          common.legend = TRUE, legend = 'none')
+
+```
+
+
+```{r}
+
+IL_6_p <- plotserieslines(df = cyto_p_plot, yvar = 'IL-6') + 
+  ylab (label = expression(Log[10] ~ pg ~ mL^-1)) +
+  ggtitle("IL-6") + 
+  #theme_pubr() + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+IL_8_p <- plotserieslines(df = cyto_p_plot, yvar = 'IL-8') + 
+  ylab (label = expression(Log[10] ~ pg ~ mL^-1)) +
+  ggtitle("IL-8") + 
+  #theme_pubr() + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+TNF_p <- plotserieslines(df = cyto_p_plot, yvar = 'TNFα') + 
+  ylab (label = expression(Log[10] ~ pg ~ mL^-1)) +
+  ggtitle("TNFα") + 
+  #theme_pubr() + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+cyto_top_plots <- ggarrange(IL_6_p , IL_8_p, TNF_p, nrow = 1,
+          common.legend = TRUE, legend = 'bottom')
+```
+
+```{r}
+fig2 <- ggarrange(ac_top_plots, nmr_top_plots, cyto_top_plots,
+          labels = c('A','B','C'),
+          nrow =3, common.legend = TRUE)
+
+ggsave(plot = fig2, 
+       filename = 'Figures/Fig2.tiff',  
+       width = 8.5, height = 13)
+```
+

@@ -1,0 +1,141 @@
+---
+title: "Metabolite-Cytokine Correlation Plot"
+output: html_notebook
+---
+
+## Introduction
+
+This R Markdown document analyzes repeated-measures correlation between cytokine and metabolomics data from the Rapid Administration of L-Carnitine in Septic Shock (RACE) clinical trial. Serum samples were collected at baseline (T0), 24-hours (T24), and 48-hours (T48) post-enrollment, and metabolic data was generated from LC-MS/MS (acylcarnitines) and 1H-NMR. This objective of this analysis is to calculate the repeated-measure correlation using the rmcorr package and investiagte the relationship between cytokines and the metabolic host-reponse in septic shock (i.e. saline placebo-treated patients). 
+
+```{r}
+library(ggcorrplot)
+library(rmcorr)
+```
+
+
+```{r}
+#prepare repeated measure dataframe 
+#use the transformed dataframe (ac_p_trans, nmr_p_trans, and model_cyto_df from the LMM modeling notebook)
+
+rmcorr_df <- ac_p_trans %>% 
+  select(studyid, Timepoint, C10: L.carnitine) %>% 
+  left_join(nmr_p_trans %>% 
+             select(studyid, Timepoint, X2.Hydroxybutyrate:Valine),
+            by =c('studyid', 'Timepoint')) %>% 
+  left_join(model_cyto_df %>% 
+              select(studyid, Fractalkine:ANG2, Timepoint),
+                     by = c('studyid', 'Timepoint')) %>% 
+  mutate(studyid = as.factor(studyid)) %>%
+  na.omit() %>% 
+  rename('2-Hydroxybutyrate' = X2.Hydroxybutyrate, 
+         '2-Oxoisocaproate' = X2.Oxoisocaproate, 
+         '3-Hydroxybutyrate' = X3.Hydroxybutyrate,
+         'Propylene Glycol' = Propylene.glycol, 
+         'Histidine' = Histidine.x)
+
+#determine coloumns names for looping  
+cols <- colnames(rmcorr_df[,3:63])
+
+#testing the rmcorr function
+rmcorr(participant = 'studyid', measure1 = 'C2', measure2 = 'C10', 
+       dataset = rmcorr_df) 
+
+#will give warning message when an analyte is correlated with itself
+rmcorr(participant = 'studyid', measure1 = 'C2', measure2 = 'C2', 
+       dataset = rmcorr_df) 
+```
+
+
+```{r}
+loop_rmcorr_r <- function(df, var1, var2){
+  fit <- rmcorr(participant = 'studyid', 
+         measure1 = get(var1), 
+         measure2 = get(var2),
+         dataset = df)
+
+  
+  r <- as.data.frame(row.names = var2, fit$r)
+  colnames(r) <- paste(var1)
+  
+  return(r)
+}
+
+loop_rmcorr_p <- function(df, var1, var2){
+  fit <- rmcorr(participant = 'studyid', 
+         measure1 = get(var1), 
+         measure2 = get(var2),
+         dataset = df)
+
+  r <- as.data.frame(row.names = var2, fit$p)
+  colnames(r) <- paste(var1)
+  
+  return(r)
+}
+```
+
+
+```{r message=F, warning=F}
+#message and warnings turned off because the loop will give warning message everytime an analyte is correlated with itself
+
+#we remove these r=1 correlations when plotting 
+
+r_df <- as_tibble()
+for (y in cols) {
+  r_df <- bind_rows(bind_cols(lapply(cols,
+              function(x)
+                loop_rmcorr_r(
+                  var1 = x,
+                  var2 = y,
+                  df = rmcorr_df))),r_df)
+}
+
+p_df <- as_tibble()
+for (y in cols) {
+  p_df <- bind_rows(bind_cols(lapply(cols,
+              function(x)
+                loop_rmcorr_p(
+                  var1 = x,
+                  var2 = y,
+                  df = rmcorr_df))),p_df)
+}
+```
+
+
+
+```{r}
+ggcorrplot(as.matrix(r_df %>% 
+                       select(52:61)%>% 
+                       filter(!row_number() %in% c(1:10))), 
+           p.mat = as.matrix(p_df %>% 
+                                select(52:61) %>%
+                      filter(!row_number() %in% c(1:10))),
+          insig = "blank", 
+          outline.color	= 'black',
+          ggtheme = theme_pubr(), 
+          tl.cex = 10  ) + 
+  scale_fill_gradient2(limit = c(-1, 1), 
+                       low = "#235070" ,
+                       high =  "#6c1d0e", 
+                       mid = "white", 
+                       midpoint = 0)
+ggsave(filename = 'Figures/Figure3.tiff', width = 15, height = 15)
+
+
+
+```
+
+```{r}
+ggcorrplot(as.matrix(r_df), 
+           p.mat = as.matrix(p_df ),
+          insig = "blank", 
+          outline.color	= 'black',
+          ggtheme = theme_pubr(), 
+          tl.cex = 10
+          ) + 
+  scale_fill_gradient2(limit = c(-1, 1), 
+                       low = "#235070" ,
+                       high =  "#6c1d0e", 
+                       mid = "white", 
+                       midpoint = 0)
+```
+
